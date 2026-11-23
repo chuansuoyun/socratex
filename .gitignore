@@ -1,0 +1,6 @@
+socratex
+*.exe
+*.test
+.DS_Store
+*.json
+.cache/
