@@ -1,0 +1,25 @@
+{
+  "mode": "server",
+  "server": {
+    "listen": ":443",
+    "http_listen": ":80",
+    "domain": "proxy.example.com",
+    "auto_cert": true,
+    "cert_file": "",
+    "key_file": "",
+    "auth": {
+      "username": "alice",
+      "password": "change-me",
+      "token": ""
+    },
+    "bypass": ["CN"],
+    "upstream": {
+      "enabled": false,
+      "type": "socks5",
+      "address": "1.2.3.4",
+      "port": 1080,
+      "username": "",
+      "password": ""
+    }
+  }
+}
