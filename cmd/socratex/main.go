@@ -14,7 +14,8 @@ import (
 	"github.com/chuansuoyun/socratex/internal/server"
 )
 
-const version = "2.0.0"
+// version is set at build time via: -ldflags "-X main.version=v2.0.0"
+var version = "2.0.0"
 
 func main() {
 	configPath := flag.String("config", "config.json", "path to config.json")
