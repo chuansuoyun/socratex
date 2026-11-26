@@ -20,6 +20,7 @@ import (
 type Client struct {
 	cfg        *config.ClientConfig
 	serverHost string
+	serverName string
 	serverURL  string
 	authHeader string
 }
@@ -43,7 +44,9 @@ func New(cfg *config.ClientConfig) (*Client, error) {
 		}
 	}
 	c.serverHost = host
+	c.serverName = u.Hostname()
 	c.serverURL = u.Scheme + "://" + host
+
 	if cfg.Username != "" {
 		cred := base64.StdEncoding.EncodeToString([]byte(cfg.Username + ":" + cfg.Password))
 		c.authHeader = "Basic " + cred
@@ -95,10 +98,11 @@ func (c *Client) handleSOCKS5(conn net.Conn) {
 	if err != nil || n < 2 || buf[0] != 0x05 {
 		return
 	}
-	conn.Write([]byte{0x05, 0x00})
+	_, _ = conn.Write([]byte{0x05, 0x00})
+
 	n, err = conn.Read(buf)
 	if err != nil || n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
-		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	var host string
@@ -124,18 +128,18 @@ func (c *Client) handleSOCKS5(conn net.Conn) {
 		host = net.IP(buf[4:20]).String()
 		port = uint16(buf[20])<<8 | uint16(buf[21])
 	default:
-		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	dest := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	remote, err := c.tunnel(dest)
 	if err != nil {
 		log.Printf("[client] tunnel %s: %v", dest, err)
-		conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer remote.Close()
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	_ = conn.SetDeadline(time.Time{})
 	relay(conn, remote)
 }
@@ -153,11 +157,12 @@ func (c *Client) handleHTTP(conn net.Conn) {
 		}
 		remote, err := c.tunnel(dest)
 		if err != nil {
-			conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			log.Printf("[client] tunnel %s: %v", dest, err)
+			_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 			return
 		}
 		defer remote.Close()
-		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		_ = conn.SetDeadline(time.Time{})
 		relay(conn, remote)
 		return
@@ -171,7 +176,8 @@ func (c *Client) handleHTTP(conn net.Conn) {
 	}
 	remote, err := c.tunnel(host)
 	if err != nil {
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		log.Printf("[client] tunnel %s: %v", host, err)
+		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer remote.Close()
@@ -185,30 +191,46 @@ func (c *Client) handleHTTP(conn net.Conn) {
 	relay(conn, remote)
 }
 
+func (c *Client) dialRemote() (net.Conn, error) {
+	d := &net.Dialer{Timeout: 15 * time.Second}
+	tlsCfg := &tls.Config{
+		ServerName: c.serverName,
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	}
+	if conn, err := d.Dial("tcp4", c.serverHost); err == nil {
+		return tls.Client(conn, tlsCfg), nil
+	}
+	raw, err := tls.DialWithDialer(d, "tcp", c.serverHost, tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 func (c *Client) tunnel(dest string) (net.Conn, error) {
-	raw, err := tls.DialWithDialer(
-		&net.Dialer{Timeout: 15 * time.Second},
-		"tcp",
-		c.serverHost,
-		&tls.Config{ServerName: stripPort(c.serverHost), MinVersion: tls.VersionTLS12},
-	)
+	raw, err := c.dialRemote()
 	if err != nil {
 		return nil, fmt.Errorf("dial remote: %w", err)
 	}
+
 	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", dest, dest)
 	if c.authHeader != "" {
 		req += "Proxy-Authorization: " + c.authHeader + "\r\n"
 	}
+	req += "Proxy-Connection: Keep-Alive\r\n"
 	req += "\r\n"
+
 	if _, err := raw.Write([]byte(req)); err != nil {
 		raw.Close()
 		return nil, err
 	}
+
 	br := bufio.NewReader(raw)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		raw.Close()
-		return nil, err
+		return nil, fmt.Errorf("read CONNECT response: %w", err)
 	}
 	if resp.StatusCode != 200 {
 		raw.Close()
@@ -226,17 +248,17 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
 }
 
-func stripPort(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr
-	}
-	return host
-}
-
 func relay(a, b net.Conn) {
 	errCh := make(chan error, 2)
-	go func() { _, err := io.Copy(a, b); errCh <- err }()
-	go func() { _, err := io.Copy(b, a); errCh <- err }()
+	go func() {
+		_, err := io.Copy(a, b)
+		errCh <- err
+	}()
+	go func() {
+		_, err := io.Copy(b, a)
+		errCh <- err
+	}()
 	<-errCh
+	_ = a.Close()
+	_ = b.Close()
 }

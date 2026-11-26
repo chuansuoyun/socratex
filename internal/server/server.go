@@ -43,7 +43,10 @@ func New(cfg *config.ServerConfig) (*Server, error) {
 	}
 	bypass := make(map[string]bool)
 	for _, c := range cfg.Bypass {
-		bypass[c] = true
+		code := strings.ToUpper(strings.TrimSpace(c))
+		if code != "" {
+			bypass[code] = true
+		}
 	}
 	return &Server{
 		cfg:      cfg,
@@ -69,6 +72,7 @@ func (s *Server) Run(ctx context.Context) error {
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/", s.handleWeb)
 	httpHandler := http.Handler(httpMux)
+
 	if s.cfg.AutoCert && s.cfg.Domain != "" && s.cfg.CertFile == "" {
 		cacheDir := filepath.Join(os.Getenv("HOME"), ".cache", "socratex-certs")
 		_ = os.MkdirAll(cacheDir, 0700)
@@ -78,14 +82,22 @@ func (s *Server) Run(ctx context.Context) error {
 			Cache:      autocert.DirCache(cacheDir),
 		}
 		tlsConfig = m.TLSConfig()
-		tlsConfig.NextProtos = []string{"http/1.1", "h2"}
+		tlsConfig.NextProtos = []string{"http/1.1"}
 		httpHandler = m.HTTPHandler(httpMux)
 	}
 
-	httpServer := &http.Server{Addr: s.cfg.HTTPListen, Handler: httpHandler}
-	httpsMux := http.NewServeMux()
-	httpsMux.HandleFunc("/", s.handleProxy)
-	httpsServer := &http.Server{Addr: s.cfg.Listen, Handler: httpsMux, TLSConfig: tlsConfig}
+	httpServer := &http.Server{
+		Addr:    s.cfg.HTTPListen,
+		Handler: httpHandler,
+	}
+
+	// HTTPS proxy: MUST NOT use ServeMux.
+	// CONNECT RequestURI is "host:port" (no leading "/"), ServeMux returns 404.
+	httpsServer := &http.Server{
+		Addr:      s.cfg.Listen,
+		Handler:   http.HandlerFunc(s.handleProxy),
+		TLSConfig: tlsConfig,
+	}
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -100,11 +112,12 @@ func (s *Server) Run(ctx context.Context) error {
 			errCh <- fmt.Errorf("https: %w", err)
 		}
 	}()
+
 	s.printBanner()
 	select {
 	case <-ctx.Done():
-		httpServer.Shutdown(context.Background())
-		httpsServer.Shutdown(context.Background())
+		_ = httpServer.Shutdown(context.Background())
+		_ = httpsServer.Shutdown(context.Background())
 		return nil
 	case err := <-errCh:
 		return err
@@ -112,14 +125,15 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) buildTLS() (*tls.Config, error) {
+	cfg := &tls.Config{NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12}
 	if s.cfg.CertFile != "" && s.cfg.KeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(s.cfg.CertFile, s.cfg.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("load cert: %w", err)
 		}
-		return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1", "h2"}}, nil
+		cfg.Certificates = []tls.Certificate{cert}
 	}
-	return &tls.Config{NextProtos: []string{"http/1.1", "h2"}}, nil
+	return cfg, nil
 }
 
 func (s *Server) printBanner() {
@@ -144,6 +158,7 @@ func (s *Server) printBanner() {
 
 func (s *Server) handleWeb(w http.ResponseWriter, r *http.Request) {
 	if !s.authenticate(r) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Socratex"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -205,29 +220,37 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	dest := r.Host
+	if dest == "" {
+		dest = r.RequestURI
+	}
 	if !strings.Contains(dest, ":") {
 		dest += ":443"
 	}
-	hostOnly, _, _ := net.SplitHostPort(dest)
-	if hostOnly == "" {
+	hostOnly, _, err := net.SplitHostPort(dest)
+	if err != nil {
 		hostOnly = dest
 	}
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
 	}
-	clientConn, _, err := hj.Hijack()
+	clientConn, bufrw, err := hj.Hijack()
 	if err != nil {
+		log.Printf("[server] hijack: %v", err)
 		return
 	}
 	defer clientConn.Close()
+
 	targetConn, err := s.dialer.Dial("tcp", dest)
 	if err != nil {
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		log.Printf("[server] dial %s: %v", dest, err)
+		fmt.Fprintf(clientConn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
 	defer targetConn.Close()
+
 	if len(s.bypass) > 0 {
 		ipStr := stripPort(targetConn.RemoteAddr().String())
 		if ip := net.ParseIP(ipStr); ip != nil {
@@ -239,8 +262,16 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[PROXY]  %s => [%s] %s via %s", dest, country, ipStr, s.dialer.String())
 			}
 		}
+	} else {
+		log.Printf("[PROXY]  %s", dest)
 	}
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	if bufrw != nil {
+		_ = bufrw.Flush()
+	}
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		return
+	}
 	relay(clientConn, targetConn)
 }
 
@@ -280,6 +311,7 @@ func (s *Server) authenticate(r *http.Request) bool {
 	if cfg.Username == "" && cfg.Token == "" {
 		return true
 	}
+
 	if t := r.URL.Query().Get("token"); t != "" && cfg.Token != "" {
 		if t == cfg.Token {
 			s.touch(r.RemoteAddr)
@@ -287,20 +319,33 @@ func (s *Server) authenticate(r *http.Request) bool {
 		}
 		return false
 	}
+
 	auth := r.Header.Get("Proxy-Authorization")
 	if auth == "" {
 		auth = r.Header.Get("Authorization")
 	}
-	if strings.HasPrefix(strings.ToLower(auth), "basic ") && cfg.Username != "" {
-		raw, err := base64.StdEncoding.DecodeString(auth[6:])
+	if strings.HasPrefix(strings.ToLower(auth), "basic ") {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(auth[6:]))
 		if err == nil {
 			parts := strings.SplitN(string(raw), ":", 2)
-			if len(parts) == 2 && parts[0] == cfg.Username && parts[1] == cfg.Password {
-				s.touch(r.RemoteAddr)
-				return true
+			if len(parts) == 2 {
+				user, pass := parts[0], parts[1]
+				if cfg.Username != "" && user == cfg.Username && pass == cfg.Password {
+					s.touch(r.RemoteAddr)
+					return true
+				}
+				if cfg.Token != "" && user == "token" && pass == cfg.Token {
+					s.touch(r.RemoteAddr)
+					return true
+				}
+				if cfg.Token != "" && user == cfg.Token {
+					s.touch(r.RemoteAddr)
+					return true
+				}
 			}
 		}
 	}
+
 	s.mu.RLock()
 	_, ok := s.sessions[stripPort(r.RemoteAddr)]
 	s.mu.RUnlock()
@@ -347,6 +392,11 @@ func (s *Server) cleanupLoop(ctx context.Context) {
 					delete(s.hosts, h)
 				}
 			}
+			for ip, ts := range s.sessions {
+				if time.Since(ts) > 24*time.Hour {
+					delete(s.sessions, ip)
+				}
+			}
 			s.mu.Unlock()
 		}
 	}
@@ -362,7 +412,15 @@ func stripPort(addr string) string {
 
 func relay(a, b net.Conn) {
 	errCh := make(chan error, 2)
-	go func() { _, err := io.Copy(a, b); errCh <- err }()
-	go func() { _, err := io.Copy(b, a); errCh <- err }()
+	go func() {
+		_, err := io.Copy(a, b)
+		errCh <- err
+	}()
+	go func() {
+		_, err := io.Copy(b, a)
+		errCh <- err
+	}()
 	<-errCh
+	_ = a.Close()
+	_ = b.Close()
 }
