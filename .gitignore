@@ -1,6 +1,8 @@
 socratex
-*.exe
+socratex.exe
 *.test
 .DS_Store
 config.json
+config.client.json
 .cache/
+dist/

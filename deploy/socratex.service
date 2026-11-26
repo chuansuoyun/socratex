@@ -1,0 +1,18 @@
+[Unit]
+Description=Socratex Secure Web Proxy (Server)
+Documentation=https://github.com/chuansuoyun/socratex
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/socratex
+ExecStart=/opt/socratex/socratex -config /opt/socratex/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
