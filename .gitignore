@@ -2,5 +2,5 @@ socratex
 *.exe
 *.test
 .DS_Store
-*.json
+config.json
 .cache/
